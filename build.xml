@@ -1,0 +1,343 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project name="jtf" default="help" basedir="." xmlns:props="antlib:org.apache.ant.props">
+
+	<description>
+	This script is used for running jtf tests. It requires wtktest/test/Misc/wfc_install to be checked out
+	so that it can start/stop wfc and run DB opearations.
+	</description>
+	
+	<target name="help" description="display help">
+		<java classname="org.apache.tools.ant.Main">
+			<arg line="-projecthelp -buildfile ${ant.file}" />
+		</java>
+	</target>
+	
+	<property name="wfc_install.path" value="${basedir}/../../Misc/wfc_install" />
+	<import file="${wfc_install.path}/build_common.xml" />
+	
+	<property environment="env" />
+	
+	<condition property="testrunner" value="testrunner.bat" else="testrunner.sh">
+		<os family="windows" />
+	</condition>
+	
+	<target name="verify.soapui.dir"> 
+		<available file="${env.SOAPUI_HOME}/bin/${testrunner}" property="found.soapUI"/>
+		<fail unless="found.soapUI" message="Error, could not find SoapUI at '${env.SOAPUI_HOME}/bin/${testrunner}'" />
+	</target>
+	
+	<!-- setup groovy libs to compile groovy scripts -->
+	<path id="groovy.build.classpath">
+		<fileset dir="${env.SOAPUI_HOME}/bin">
+			<include name="**/*.jar"/>
+		</fileset>
+		<fileset dir="${env.SOAPUI_HOME}/lib">
+			<include name="**/*.jar"/>
+		</fileset>
+	</path>
+	
+	<property name="groovy.src" value="${basedir}/KronosSoapUILib" />
+	<property name="groovy.class.dir" value="${basedir}/classes" />
+	<property name="kronos.lib" value="KronosSoapUILib.jar" />
+	<property name="archive.wfc.logs" value="true" />
+	<property name="test.results" value="${basedir}/TestResults" />
+	
+	<!-- add parameter to ${testrunner} to enable the determination @ runtime where to run the suite -->
+	<property name="dest.host" value="localhost" />
+	<property name="protocol" value="http" />
+	<property name="endpoint" value="wfc/XmlService" />
+	<property name="wfcWebServiceURL" value="${protocol}://${dest.host}" />
+	<property name="DEFAULT_DSN_NAME" value="wfc" />
+	<property name="wfcXMLServiceURL" value="${protocol}://${dest.host}/${DEFAULT_DSN_NAME}/XmlService" />
+
+	
+	<!-- sometimes Jenkins will not send the correct property, make sure that
+		soapui_inclusions was properly set by Jenkins  -->
+	<condition property="soapui.inclusions" value="**/*.xml" >
+		<or>
+			<not><isset property="soapui_inclusions" /> </not>
+			<equals arg1="${soapui_inclusions}" arg2="$soapui_inclusions" />
+		</or>
+	</condition>
+	<property name="soapui.inclusions" value="${soapui_inclusions}" />
+	
+	<available file="${basedir}/${projects}/conf/test.properties" property="found.file" />
+	
+	<target name="stage.properties.file" unless="found.file">
+		<mkdir dir="${basedir}/${projects}/conf" />
+		<copy file="${basedir}/build.properties" tofile="${basedir}/${projects}/conf/test.properties" />
+	</target>
+	
+	<target name="build.kronos.lib" depends="verify.soapui.dir" description="build the helper library 'KronosSoapUILib.jar'">
+		<taskdef name="groovyc" classname="org.codehaus.groovy.ant.Groovyc" classpathref="groovy.build.classpath"/>
+		
+		<delete dir="${groovy.class.dir}" />
+		<mkdir dir="${groovy.class.dir}" />
+		<groovyc srcdir="${groovy.src}" destdir="${groovy.class.dir}" listfiles="true" classpath="groovy.build.classpath" />
+		<jar basedir="${groovy.class.dir}" destfile="${basedir}/${kronos.lib}" />
+		
+		<!-- to enable soapui to run in parallel, attempt to move the .jar and don't fail if the file is locked -->
+		<move file="${basedir}/${kronos.lib}" todir="${env.SOAPUI_HOME}/bin/ext" failonerror="false" overwrite="true"/>
+	</target>
+	
+	<target name="setup.start.wfc" depends="stage.properties.file">
+		<fail unless="projects" message="Error. Please specify a property called 'projects'." />
+		
+		<property file="${basedir}/${projects}/conf/test.properties" />
+
+		<!-- stop wfc (although the expectation is that it should be stopped already) -->
+		<ant target="wfc.stop" dir="${wfc_install.path}" />
+		
+		<!-- determine if the database should be restaged -->
+		<condition property="restage.enabled">
+			<istrue value="${restage.db}" />
+		</condition>
+		<antcall target="restage.db" />
+		
+		<!-- are there custom setup/teardown steps? -->
+		<condition property="custom.steps">
+			<istrue value="${test.conf.req}" />
+		</condition>
+		
+		<!-- run configuration if necessary -->
+		<antcall target="setup" />
+		<antcall target="setup.sql.prestart">
+			<param name="mss.file" value="${basedir}/${projects}/conf/setup.prestart.sql" />
+			<param name="ora.file" value="${basedir}/${projects}/conf/setup.prestart.ora.sql" />
+		</antcall>
+		
+		<!-- start wfc -->
+		<ant target="wfc.start" dir="${wfc_install.path}" />
+		<antcall target="setup.sql.poststart">
+			<param name="mss.file" value="${basedir}/${projects}/conf/setup.poststart.sql" />
+			<param name="ora.file" value="${basedir}/${projects}/conf/setup.poststart.ora.sql" />
+		</antcall>		
+	</target>
+	
+	<target name="run.tests" depends="build.kronos.lib, stage.properties.file">
+		<property file="${basedir}/${projects}/conf/test.properties" />
+
+		<!-- are there custom setup/teardown steps? -->
+		<condition property="custom.test.steps">
+			<istrue value="${pretest.conf.req}" />
+		</condition>
+		
+		<antcall target="setup.pretest" />
+	
+		<!-- use a propertyfile counter to enable better ordering of the soapui tests being run -->
+		<tempfile createfile="true" deleteonexit="true" property="counter.file" />
+		<propertyfile file="${counter.file}">
+			<entry default="0" key="count" operation="+" pattern="0000" type="int" />
+		</propertyfile>
+		<!-- set connection string based on db type -->
+		<condition property="CONNECTION_STRING" 
+			value="jdbc:oracle:thin:${#Project#DEFAULT_DB_USERNAME}/${#Project#DEFAULT_DB_PASSWORD}@${#Project#DEFAULT_DBSERVER_NAME}:${#Project#DEFAULT_DBPORT}:${#Project#DEFAULT_DB_OR_SID_NAME}"
+			else="jdbc:sqlserver://${#Project#DEFAULT_DBSERVER_NAME}:${#Project#DEFAULT_DBPORT};databaseName=${#Project#DEFAULT_DB_OR_SID_NAME};user=${#Project#DEFAULT_DB_USERNAME};password=${#Project#DEFAULT_DB_PASSWORD}">
+		  <equals arg1="${DEFAULT_DBPLATFORM}"
+				  arg2="oracle" />
+		</condition>
+		<!-- use existing ant script if found in the root of the project folder,
+			otherwise, execute all of the SoapUI test suites in alphabetical order -->
+		<available file="${basedir}/${projects}/build.xml" property="run.type" value="withbuild" />
+		<property name="run.type" value="withoutbuild" />
+		<antcall target="run.tests.${run.type}" />
+		
+		<antcall target="teardown.posttest" />
+	</target>
+	
+	<target name="stop.teardown.wfc" depends="stage.properties.file">
+		<property file="${basedir}/${projects}/conf/test.properties" />
+
+		<!-- are there custom setup/teardown steps? -->
+		<condition property="custom.steps">
+			<istrue value="${test.conf.req}" />
+		</condition>
+
+		<antcall target="teardown.sql.prestop">
+			<param name="mss.file" value="${basedir}/${projects}/conf/teardown.prestop.sql" />
+			<param name="ora.file" value="${basedir}/${projects}/conf/teardown.prestop.ora.sql" />
+		</antcall>
+		
+		<!-- stop wfc -->
+		<subant target="wfc.stop" failonerror="false">
+			<filelist dir="${wfc_install.path}" files="build.xml"/>
+		</subant>
+
+		<antcall target="archive.wfc.logs" />
+		
+		<!-- do configuration cleanup if necessary -->
+		<antcall target="teardown" />
+		<antcall target="teardown.sql.poststop">
+			<param name="mss.file" value="${basedir}/${projects}/conf/teardown.poststop.sql" />
+			<param name="ora.file" value="${basedir}/${projects}/conf/teardown.poststop.ora.sql" />
+		</antcall>
+	</target>
+	
+	<target name="run.test.suite" depends="setup.start.wfc,run.tests,stop.teardown.wfc" description="run an individual SoapUI test suite" />
+	
+	<target name="archive.wfc.logs" if="${archive.wfc.logs}">
+		<copy todir="${test.results}/wfc_logs">
+			<fileset dir="${installLocation}/${DEFAULT_DSN_NAME}/logs" />
+		</copy>
+	</target>
+	
+	<target name="run.tests.withbuild">
+		<!-- run the tests, use subant (instead of ant) so that we don't have to fail on error -->
+		<subant failonerror="false" inheritall="true">
+			<filelist dir="${basedir}/${projects}" files="build.xml"/>
+			<target name="runtests" />
+		</subant>
+	</target>
+	
+	<target name="run.tests.withoutbuild">
+		<!-- use apply to run soapui on all .xml files in the resouce collection -->
+		<sort id="files">
+			<fileset dir="${basedir}/${projects}" includes="${soapui.inclusions}" excludes="**/*build.xml"/>
+		</sort>
+		
+		<pathconvert pathsep="${line.separator}" property="myfiles" refid="files"/>
+		<echo>The following SoapUI files were found: ${myfiles}</echo>
+		<apply dir="${ant.home}/bin" executable="cmd.exe" vmlauncher="false" verbose="true" failonerror="false">
+			<arg value="/c" />
+			<arg value="ant" />
+			<arg value='-Dtest.results="${test.results}"' />
+			<arg value='-DDEFAULT_DBSERVER_NAME=${DEFAULT_DBSERVER_NAME}' />
+			<arg value='-DDEFAULT_DB_USERNAME=${DEFAULT_DB_USERNAME}' />
+			<arg value='-DDEFAULT_DB_PASSWORD=${DEFAULT_DB_PASSWORD}' />
+			<arg value='-DDEFAULT_DB_OR_SID_NAME=${DEFAULT_DB_OR_SID_NAME}' />
+			<arg value='-DDEFAULT_DBPLATFORM=${DEFAULT_DBPLATFORM}' />
+			<arg value='-DCONNECTION_STRING=&quot;${CONNECTION_STRING}&quot;' />
+			<arg value='-Dcounter.file=${counter.file}' />
+			<arg value='-Ddest.host=${dest.host}' />
+			<arg value='-DwfcWebServiceURL=${wfcWebServiceURL}' />
+			<arg value='-DwfcXMLServiceURL=${wfcXMLServiceURL}' />
+			<arg value="-f" />
+			<arg value='"${ant.file}"' />
+			<arg value="execute.soapui" />
+			<arg value="-Dsoapui.suite="/>
+			<sort refid="files" />
+		</apply>
+	</target>
+	
+	<!-- note that this target is called directly by the individual test suites -->
+	<target name="execute.soapui">
+		<property name="soapui.db.props" value="-PDEFAULT_DBSERVER_NAME=${DEFAULT_DBSERVER_NAME} -PDEFAULT_DB_USERNAME=${DEFAULT_DB_USERNAME} -PDEFAULT_DB_PASSWORD=${DEFAULT_DB_PASSWORD} -PDEFAULT_DB_OR_SID_NAME=${DEFAULT_DB_OR_SID_NAME} -PDEFAULT_DBPORT=${jdbc.port} -PCONNECTION_STRING=&quot;${CONNECTION_STRING}&quot; -PDEFAULT_CONNECTION_DRIVER=${jdbc.driver} -PwfcWebServiceURL=${wfcWebServiceURL} -PwfcXMLServiceURL=${wfcXMLServiceURL}" />
+		<property name="soapui.cmd" value="${testrunner} -j -a -h${dest.host} -f${test.results} ${soapui.db.props} ${soapui.suite}" />
+		<echo message="Running ${soapui.suite} with command line '${env.SOAPUI_HOME}/bin/${soapui.cmd}'"/>
+		<exec dir="${env.SOAPUI_HOME}/bin" executable="cmd.exe" vmlauncher="false">
+			<arg line="/c ${soapui.cmd}" />
+		</exec>
+	
+		<antcall target="concatenate.results" />
+	</target>
+	
+	<target name="concatenate.results">
+		<!-- concatenate all the test results into one file and then delete the individual files -->
+		<fileset id="results" dir="${test.results}" includes="*-OK.txt,*-FAILED.txt,*-UNKNOWN.txt" />
+		<basename property="suite.name" file="${soapui.suite}" suffix=".xml"/>
+   		<loadproperties srcFile="${counter.file}" />
+
+		<property name="test.results.filename" value="Results_${count}_${suite.name}.txt" />
+		<property name="test.results.file" value="${test.results}/${test.results.filename}" />
+		<echo message="Concatenating all SoapUI output files into ${test.results.file}" />
+		<concat destfile="${test.results.file}">
+			<sort>
+				<fileset refid="results" />
+				<date />
+			</sort>
+		</concat>
+		<delete>
+			<fileset refid="results" />
+		</delete>
+
+		<!-- if the file is greater than 2 MB, compress it -->
+		<condition property="file.greater.than.two.megs">
+			<length file="${test.results.file}" length="2000000" when="gt" />
+		</condition>
+		<antcall target="compress.results" />
+		
+		<propertyfile file="${counter.file}">
+			<entry default="0" key="count" operation="+" pattern="0000" type="int" />
+		</propertyfile>
+	</target>
+	
+	<target name="compress.results" if="${file.greater.than.two.megs}">
+		<echo>Compressing file ${test.results.file}...</echo>
+		<zip destfile="${test.results}/Results_${count}_${suite.name}.zip">
+			<fileset dir="${test.results}" includes="${test.results.filename}"/>
+		</zip>
+		<delete file="${test.results.file}" verbose="true" />
+	</target>
+	
+	<target name="restage.db" if="restage.enabled">
+	
+		<!-- oracle files may be named differently from sql server files. Check to see if
+			an oracle specific filename is used for the suite under test -->
+		<condition property="actual.db.name" value="${db.ora.type}">
+			<and>
+				<equals arg1="${DEFAULT_DBPLATFORM}" arg2="oracle" />
+				<isset property="db.ora.type" />
+			</and>
+		</condition>
+		<property name="actual.db.name" value="${db.type}" />
+		
+		<ant target="db.all"  dir="${wfc_install.path}">
+			<property name="default.db.overlay.type" value="${actual.db.name}" />
+			<property name="enable.db.overlay" value="true" />
+		</ant>	
+	</target>
+	
+	<target name="setup" if="custom.steps">
+		<ant dir="${basedir}/${projects}/conf" target="setup" />
+	</target>
+	
+	<target name="teardown" if="custom.steps">
+		<ant dir="${basedir}/${projects}/conf" target="teardown" />	
+	</target>
+	
+	<target name="setup.pretest" if="custom.test.steps">
+		<ant dir="${basedir}/${projects}/conf" target="setup.pretest" />
+	</target>
+	
+	<target name="teardown.posttest" if="custom.test.steps">
+		<ant dir="${basedir}/${projects}/conf" target="teardown.posttest" />
+	</target>
+	
+	<target name="find.sql.file">
+		<fail unless="mss.file" message="Error, please set property 'sql.file'" />
+		<condition property="found.sql.file">
+			<or>
+				<available file="${mss.file}" />
+				<available file="${ora.file}" />
+			</or>
+		</condition>
+		
+		<condition property="actual.sql" value="${ora.file}">
+			<and>
+				<equals arg1="${DEFAULT_DBPLATFORM}" arg2="oracle" />
+				<available file="${ora.file}" />
+			</and>
+		</condition>
+		<property name="actual.sql" value="${mss.file}" />
+		
+		<dirname file="${actual.sql}" property="sql.dir" />
+		<basename file="${actual.sql}" property="sql.files" />
+	</target>
+	
+	<target name="setup.sql.prestart" depends="find.sql.file" if="${found.sql.file}">
+		<ant antfile="build_db.xml" target="-db.run.script.mst"  dir="${wfc_install.path}" />
+	</target>
+	
+	<target name="setup.sql.poststart" depends="find.sql.file" if="${found.sql.file}">
+		<ant antfile="build_db.xml" target="-db.run.script.mst"  dir="${wfc_install.path}" />
+	</target>
+	
+	<target name="teardown.sql.prestop" depends="find.sql.file" if="${found.sql.file}">
+		<ant antfile="build_db.xml" target="-db.run.script.mst"  dir="${wfc_install.path}" />
+	</target>
+	
+	<target name="teardown.sql.poststop" depends="find.sql.file" if="${found.sql.file}">
+		<ant antfile="build_db.xml" target="-db.run.script.mst"  dir="${wfc_install.path}" />
+	</target>
+	
+</project>
